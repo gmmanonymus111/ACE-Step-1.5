@@ -12,8 +12,10 @@ import tempfile
 from typing import Optional, Union, List, Dict, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from loguru import logger
+import torch
 
-from acestep.audio_utils import AudioSaver, generate_uuid_from_params
+
+from acestep.audio_utils import AudioSaver, generate_uuid_from_params, normalize_audio
 
 # HuggingFace Space environment detection
 IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
@@ -49,6 +51,12 @@ class GenerationParams:
         timesignature: Time signature (2 for '2/4', 3 for '3/4', 4 for '4/4', 6 for '6/8'). Leave empty for auto-detection.
         vocal_language: Language code for vocals, e.g., "en", "zh", "ja", or "unknown". see acestep/constants.py:VALID_LANGUAGES
         duration: Target audio length in seconds. If <0 or None, model chooses automatically. 10 ~ 600
+        
+        # Audio Post-Processing
+        enable_normalization: Whether to apply loudness normalization to the output audio.
+        normalization_db: Target loudness in dB for normalization (e.g., -1.0 for -1 dBFS peak).
+        latent_shift: Additive shift applied to DiT latents before VAE decode (default 0, no shift).
+        latent_rescale: Multiplicative rescale applied to DiT latents before VAE decode (default 1.0, no rescale).
         
         # Generation Parameters
         inference_steps: Number of diffusion steps (e.g., 8 for turbo, 32–100 for base model).
@@ -104,6 +112,14 @@ class GenerationParams:
     keyscale: str = ""
     timesignature: str = ""
     duration: float = -1.0
+
+    # Audio Post-Processing
+    enable_normalization: bool = True
+    normalization_db: float = -1.0
+
+    # Latent Post-Processing (before VAE decode)
+    latent_shift: float = 0.0       # Additive shift on DiT latents. Default 0 = no shift.
+    latent_rescale: float = 1.0     # Multiplicative rescale on DiT latents. Default 1.0 = no rescale.
 
     # Advanced Settings
     inference_steps: int = 8
@@ -581,6 +597,8 @@ def generate_music(
             shift=params.shift,
             infer_method=params.infer_method,
             timesteps=params.timesteps,
+            latent_shift=params.latent_shift,
+            latent_rescale=params.latent_rescale,
             progress=progress,
         )
 
@@ -632,8 +650,26 @@ def generate_music(
             audio_tensor = dit_audio.get("tensor")
             sample_rate = dit_audio.get("sample_rate", 48000)
 
+            # --- NORMALIZATION & LOGGING ---
+            if params.enable_normalization and params.normalization_db <= 0.0:
+                 try:
+                     peak_before = torch.max(torch.abs(audio_tensor)).item()
+                     logger.info(f"[Normalization] Audio {idx} BEFORE: Peak={peak_before:.4f}, Target={params.normalization_db}dB")
+                     
+                     audio_tensor = normalize_audio(audio_tensor, params.normalization_db)
+                     
+                     peak_after = torch.max(torch.abs(audio_tensor)).item()
+                     logger.info(f"[Normalization] Audio {idx} AFTER: Peak={peak_after:.4f}")
+                     
+                     # Update the tensor in the dict so downstream uses the normalized version ??
+                     # Actually we use audio_tensor variable below, so it's fine.
+                 except Exception as e:
+                     logger.error(f"Normalization failed: {e}")
+            # -------------------------------
+
             # Generate UUID for this audio (moved from handler)
             batch_seed = seed_list[idx] if idx < len(seed_list) else seed_list[0] if seed_list else -1
+
             audio_code_str = lm_generated_audio_codes_list[idx] if (
                 lm_generated_audio_codes_list and idx < len(lm_generated_audio_codes_list)) else audio_code_string_to_use
             if isinstance(audio_code_str, list):
@@ -644,8 +680,12 @@ def generate_music(
             # Save audio file (handled outside handler)
             audio_path = None
             if audio_tensor is not None and save_dir is not None:
+
                 try:
-                    audio_file = os.path.join(save_dir, f"{audio_key}.{audio_format}")
+                    # Handle wav32 special case for extension
+                    file_ext = "wav" if audio_format == "wav32" else audio_format
+                    audio_file = os.path.join(save_dir, f"{audio_key}.{file_ext}")
+                    
                     audio_path = audio_saver.save_audio(audio_tensor,
                                                         audio_file,
                                                         sample_rate=sample_rate,

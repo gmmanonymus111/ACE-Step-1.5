@@ -3,18 +3,23 @@ Generation Input Handlers Module
 Contains event handlers and helper functions related to generation inputs
 """
 import os
+import sys
 import json
 import random
 import glob
 import gradio as gr
 from typing import Optional, List, Tuple
+from loguru import logger
 from acestep.constants import (
     TASK_TYPES_TURBO,
     TASK_TYPES_BASE,
 )
 from acestep.gradio_ui.i18n import t
 from acestep.inference import understand_music, create_sample, format_sample
-from acestep.gpu_config import get_global_gpu_config
+from acestep.gpu_config import (
+    get_global_gpu_config, is_lm_model_size_allowed, find_best_lm_model_on_disk,
+    get_gpu_config_for_tier, set_global_gpu_config, GPU_TIER_LABELS, GPU_TIER_CONFIGS,
+)
 
 
 def clamp_duration_to_gpu_limit(duration_value: Optional[float], llm_handler=None) -> Optional[float]:
@@ -144,6 +149,11 @@ def load_metadata(file_obj, llm_handler=None):
             audio_duration = -1
         
         batch_size = metadata.get('batch_size', 2)
+        # Clamp batch_size to GPU memory limit
+        gpu_config = get_global_gpu_config()
+        lm_initialized = llm_handler.llm_initialized if llm_handler else False
+        max_batch_size = gpu_config.max_batch_size_with_lm if lm_initialized else gpu_config.max_batch_size_without_lm
+        batch_size = min(int(batch_size), max_batch_size)
         inference_steps = metadata.get('inference_steps', 8)
         guidance_scale = metadata.get('guidance_scale', 7.0)
         seed = metadata.get('seed', '-1')
@@ -151,7 +161,7 @@ def load_metadata(file_obj, llm_handler=None):
         use_adg = metadata.get('use_adg', False)
         cfg_interval_start = metadata.get('cfg_interval_start', 0.0)
         cfg_interval_end = metadata.get('cfg_interval_end', 1.0)
-        audio_format = metadata.get('audio_format', 'mp3')
+        audio_format = metadata.get('audio_format', 'flac')
         lm_temperature = metadata.get('lm_temperature', 0.85)
         lm_cfg_scale = metadata.get('lm_cfg_scale', 2.0)
         lm_top_k = metadata.get('lm_top_k', 0)
@@ -435,17 +445,55 @@ def update_model_type_settings(config_path):
     return get_model_type_ui_settings(is_turbo)
 
 
-def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, device, init_llm, lm_model_path, backend, use_flash_attention, offload_to_cpu, offload_dit_to_cpu, compile_model, quantization):
-    """Wrapper for service initialization, returns status, button state, accordion state, and model type settings"""
+def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, device, init_llm, lm_model_path, backend, use_flash_attention, offload_to_cpu, offload_dit_to_cpu, compile_model, quantization, mlx_dit=True):
+    """Wrapper for service initialization, returns status, button state, accordion state, model type settings, and GPU-config-aware UI limits."""
     # Convert quantization checkbox to value (int8_weight_only if checked, None if not)
     quant_value = "int8_weight_only" if quantization else None
+    
+    # --- Tier-aware validation before initialization ---
+    gpu_config = get_global_gpu_config()
+    
+    # macOS safety: force-disable compile and quantization even if user checked them
+    if sys.platform == "darwin":
+        if compile_model:
+            logger.info("macOS detected: disabling torch.compile (not supported on MPS)")
+            compile_model = False
+        if quantization:
+            logger.info("macOS detected: disabling INT8 quantization (torchao incompatible with MPS)")
+            quantization = False
+            quant_value = None
+    
+    # Validate LM request against GPU tier
+    if init_llm and not gpu_config.available_lm_models:
+        init_llm = False  # Force disable LM on tiers that can't support it
+        logger.warning(f"⚠️ LM initialization disabled: GPU tier {gpu_config.tier} ({gpu_config.gpu_memory_gb:.1f}GB) does not support LM")
+    
+    # Validate LM model against tier's available models (size-based matching)
+    if init_llm and lm_model_path and gpu_config.available_lm_models:
+        if not is_lm_model_size_allowed(lm_model_path, gpu_config.available_lm_models):
+            # The selected model's size class is not supported by this tier.
+            # Find a disk model that matches the recommended size.
+            all_disk_models = llm_handler.get_available_5hz_lm_models() if llm_handler else []
+            fallback = find_best_lm_model_on_disk(gpu_config.recommended_lm_model, all_disk_models)
+            if fallback:
+                old_model = lm_model_path
+                lm_model_path = fallback
+                logger.warning(f"⚠️ LM model {old_model} size not supported for tier {gpu_config.tier}, falling back to {lm_model_path}")
+            else:
+                init_llm = False
+                logger.warning(f"⚠️ No compatible LM model found on disk for tier {gpu_config.tier}, disabling LM")
+    
+    # Validate backend against tier restriction
+    if init_llm and gpu_config.lm_backend_restriction == "pt_mlx_only" and backend == "vllm":
+        backend = gpu_config.recommended_backend  # Fallback to pt
+        logger.warning(f"⚠️ vllm backend not supported for tier {gpu_config.tier} (VRAM too low for KV cache), falling back to {backend}")
     
     # Initialize DiT handler
     status, enable = dit_handler.initialize_service(
         checkpoint, config_path, device,
         use_flash_attention=use_flash_attention, compile_model=compile_model, 
         offload_to_cpu=offload_to_cpu, offload_dit_to_cpu=offload_dit_to_cpu,
-        quantization=quant_value
+        quantization=quant_value, use_mlx_dit=mlx_dit,
     )
     
     # Initialize LM handler if requested
@@ -462,7 +510,7 @@ def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, devi
             backend=backend,
             device=device,
             offload_to_cpu=offload_to_cpu,
-            dtype=dit_handler.dtype
+            dtype=None,
         )
         
         if lm_success:
@@ -480,38 +528,170 @@ def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, devi
     is_turbo = dit_handler.is_turbo_model()
     model_type_settings = get_model_type_ui_settings(is_turbo)
     
+    # --- Update UI limits based on GPU config and actual LM state ---
+    gpu_config = get_global_gpu_config()
+    lm_actually_initialized = llm_handler.llm_initialized if llm_handler else False
+    max_duration = gpu_config.max_duration_with_lm if lm_actually_initialized else gpu_config.max_duration_without_lm
+    max_batch = gpu_config.max_batch_size_with_lm if lm_actually_initialized else gpu_config.max_batch_size_without_lm
+    
+    duration_update = gr.update(
+        maximum=float(max_duration),
+        info=f"Duration in seconds (-1 for auto). Max: {max_duration}s / {max_duration // 60} min"
+    )
+    batch_update = gr.update(
+        value=min(2, max_batch),  # Clamp value to new maximum to avoid Gradio validation error
+        maximum=max_batch,
+        info=f"Number of samples to generate (Max: {max_batch})"
+    )
+    
+    # Add GPU config info to status
+    status += f"\n📊 GPU Config: tier={gpu_config.tier}, max_duration={max_duration}s, max_batch={max_batch}"
+    if gpu_config.available_lm_models:
+        status += f", available_lm={gpu_config.available_lm_models}"
+    else:
+        status += ", LM not available for this GPU tier"
+    
     return (
         status, 
         gr.update(interactive=enable), 
         accordion_state,
-        *model_type_settings
+        *model_type_settings,
+        # GPU-config-aware UI updates
+        duration_update,
+        batch_update,
     )
 
 
-def get_model_type_ui_settings(is_turbo: bool):
-    """Get UI settings based on whether the model is turbo or base"""
-    if is_turbo:
-        # Turbo model: max 20 steps, default 8, show shift with default 3.0, only show text2music/repaint/cover
-        return (
-            gr.update(value=8, maximum=20, minimum=1),  # inference_steps
-            gr.update(visible=False),  # guidance_scale
-            gr.update(visible=False),  # use_adg
-            gr.update(value=3.0, visible=True),  # shift (show with default 3.0)
-            gr.update(visible=False),  # cfg_interval_start
-            gr.update(visible=False),  # cfg_interval_end
-            gr.update(choices=TASK_TYPES_TURBO),  # task_type
-        )
+def on_tier_change(selected_tier, llm_handler=None):
+    """
+    Handle manual tier override from the UI dropdown.
+    
+    Updates the global GPU config and returns gr.update() for all
+    affected UI components so they reflect the new tier's defaults.
+    
+    Returns a tuple of gr.update() objects for:
+        (offload_to_cpu, offload_dit_to_cpu, compile_model, quantization,
+         backend_dropdown, lm_model_path, init_llm, batch_size_input,
+         audio_duration, gpu_info_display)
+    """
+    if not selected_tier or selected_tier not in GPU_TIER_CONFIGS:
+        logger.warning(f"Invalid tier selection: {selected_tier}")
+        return (gr.update(),) * 10
+    
+    # Build new config for the selected tier and update global
+    new_config = get_gpu_config_for_tier(selected_tier)
+    set_global_gpu_config(new_config)
+    logger.info(f"🔄 Tier manually changed to {selected_tier} — updating UI defaults")
+    
+    # Backend choices
+    if new_config.lm_backend_restriction == "pt_mlx_only":
+        available_backends = ["pt", "mlx"]
     else:
-        # Base model: max 200 steps, default 32, show CFG/ADG/shift, show all task types
-        return (
-            gr.update(value=32, maximum=200, minimum=1),  # inference_steps
-            gr.update(visible=True),  # guidance_scale
-            gr.update(visible=True),  # use_adg
-            gr.update(value=3.0, visible=True),  # shift (effective for base, default 3.0)
-            gr.update(visible=True),  # cfg_interval_start
-            gr.update(visible=True),  # cfg_interval_end
-            gr.update(choices=TASK_TYPES_BASE),  # task_type
-        )
+        available_backends = ["vllm", "pt", "mlx"]
+    recommended_backend = new_config.recommended_backend
+    if recommended_backend not in available_backends:
+        recommended_backend = available_backends[0]
+    
+    # LM model choices — filter disk models by tier
+    tier_lm_models = new_config.available_lm_models
+    all_disk_models = llm_handler.get_available_5hz_lm_models() if llm_handler else []
+    if tier_lm_models:
+        filtered = [m for m in all_disk_models if is_lm_model_size_allowed(m, tier_lm_models)]
+        available_lm_models = filtered if filtered else all_disk_models
+    else:
+        available_lm_models = all_disk_models
+    
+    recommended_lm = new_config.recommended_lm_model
+    default_lm_model = find_best_lm_model_on_disk(recommended_lm, available_lm_models)
+    
+    # Duration and batch limits (use without-LM limits as safe default; init will refine)
+    max_duration = new_config.max_duration_without_lm
+    max_batch = new_config.max_batch_size_without_lm
+    
+    # GPU info markdown update
+    tier_label = GPU_TIER_LABELS.get(selected_tier, selected_tier)
+    from acestep.gpu_config import get_gpu_device_name
+    _gpu_device_name = get_gpu_device_name()
+    gpu_info_text = f"🖥️ **{_gpu_device_name}** — {new_config.gpu_memory_gb:.1f} GB VRAM — {t('service.gpu_auto_tier')}: **{tier_label}**"
+    
+    return (
+        # offload_to_cpu_checkbox
+        gr.update(value=new_config.offload_to_cpu_default,
+                  info=t("service.offload_cpu_info") + (" (recommended for this tier)" if new_config.offload_to_cpu_default else " (optional for this tier)")),
+        # offload_dit_to_cpu_checkbox
+        gr.update(value=new_config.offload_dit_to_cpu_default,
+                  info=t("service.offload_dit_cpu_info") + (" (recommended for this tier)" if new_config.offload_dit_to_cpu_default else " (optional for this tier)")),
+        # compile_model_checkbox
+        gr.update(value=new_config.compile_model_default),
+        # quantization_checkbox
+        gr.update(value=new_config.quantization_default,
+                  info=t("service.quantization_info") + (" (recommended for this tier)" if new_config.quantization_default else " (optional for this tier)")),
+        # backend_dropdown
+        gr.update(choices=available_backends, value=recommended_backend),
+        # lm_model_path
+        gr.update(choices=available_lm_models, value=default_lm_model,
+                  info=t("service.lm_model_path_info") + (f" (Recommended: {recommended_lm})" if recommended_lm else " (LM not available for this GPU tier)")),
+        # init_llm_checkbox
+        gr.update(value=new_config.init_lm_default),
+        # batch_size_input
+        gr.update(value=min(2, max_batch), maximum=max_batch,
+                  info=f"Number of samples to generate (Max: {max_batch})"),
+        # audio_duration
+        gr.update(maximum=float(max_duration),
+                  info=f"Duration in seconds (-1 for auto). Max: {max_duration}s / {max_duration // 60} min"),
+        # gpu_info_display
+        gr.update(value=gpu_info_text),
+    )
+
+
+def get_ui_control_config(is_turbo: bool) -> dict:
+    """Return UI control configuration (values, limits, visibility) for model type.
+    Used by both interactive init and service-mode startup so controls stay consistent.
+    """
+    if is_turbo:
+        return {
+            "inference_steps_value": 8,
+            "inference_steps_maximum": 20,
+            "inference_steps_minimum": 1,
+            "guidance_scale_visible": False,
+            "use_adg_visible": False,
+            "shift_value": 3.0,
+            "shift_visible": True,
+            "cfg_interval_start_visible": False,
+            "cfg_interval_end_visible": False,
+            "task_type_choices": TASK_TYPES_TURBO,
+        }
+    else:
+        return {
+            "inference_steps_value": 32,
+            "inference_steps_maximum": 200,
+            "inference_steps_minimum": 1,
+            "guidance_scale_visible": True,
+            "use_adg_visible": True,
+            "shift_value": 3.0,
+            "shift_visible": True,
+            "cfg_interval_start_visible": True,
+            "cfg_interval_end_visible": True,
+            "task_type_choices": TASK_TYPES_BASE,
+        }
+
+
+def get_model_type_ui_settings(is_turbo: bool):
+    """Get gr.update() tuple for model-type controls (used by init button / config_path change)."""
+    cfg = get_ui_control_config(is_turbo)
+    return (
+        gr.update(
+            value=cfg["inference_steps_value"],
+            maximum=cfg["inference_steps_maximum"],
+            minimum=cfg["inference_steps_minimum"],
+        ),
+        gr.update(visible=cfg["guidance_scale_visible"]),
+        gr.update(visible=cfg["use_adg_visible"]),
+        gr.update(value=cfg["shift_value"], visible=cfg["shift_visible"]),
+        gr.update(visible=cfg["cfg_interval_start_visible"]),
+        gr.update(visible=cfg["cfg_interval_end_visible"]),
+        gr.update(choices=cfg["task_type_choices"]),
+    )
 
 
 def update_negative_prompt_visibility(init_llm_checked):
@@ -519,18 +699,35 @@ def update_negative_prompt_visibility(init_llm_checked):
     return gr.update(visible=init_llm_checked)
 
 
-def update_audio_cover_strength_visibility(task_type_value, init_llm_checked):
-    """Update audio_cover_strength visibility and label"""
-    # Show if task is cover OR if LM is initialized
-    is_visible = (task_type_value == "cover") or init_llm_checked
-    # Change label based on context
-    if init_llm_checked and task_type_value != "cover":
-        label = "LM codes strength"
-        info = "Control how many denoising steps use LM-generated codes"
+def _has_reference_audio(reference_audio) -> bool:
+    """True if reference_audio has a usable value (Gradio Audio returns path string or (path, sr))."""
+    if reference_audio is None:
+        return False
+    if isinstance(reference_audio, str):
+        return bool(reference_audio.strip())
+    if isinstance(reference_audio, (list, tuple)) and reference_audio:
+        return bool(reference_audio[0])
+    return False
+
+
+def update_audio_cover_strength_visibility(task_type_value, init_llm_checked, reference_audio=None):
+    """Update audio_cover_strength visibility and label. Show Similarity/Denoise when reference audio is present."""
+    has_reference = _has_reference_audio(reference_audio)
+    # Show if task is cover, LM is initialized, or reference audio is present (audio-conditioned generation)
+    is_visible = (task_type_value == "cover") or init_llm_checked or has_reference
+    # Label priority: cover -> LM codes -> Similarity/Denoise (reference audio)
+    if task_type_value == "cover":
+        label = t("generation.cover_strength_label")
+        info = t("generation.cover_strength_info")
+    elif init_llm_checked:
+        label = t("generation.codes_strength_label")
+        info = t("generation.codes_strength_info")
+    elif has_reference:
+        label = t("generation.similarity_denoise_label")
+        info = t("generation.similarity_denoise_info")
     else:
-        label = "Audio Cover Strength"
-        info = "Control how many denoising steps use cover mode"
-    
+        label = t("generation.cover_strength_label")
+        info = t("generation.cover_strength_info")
     return gr.update(visible=is_visible, label=label, info=info)
 
 
@@ -546,7 +743,8 @@ def update_instruction_ui(
     track_name_value: Optional[str], 
     complete_track_classes_value: list, 
     audio_codes_content: str = "",
-    init_llm_checked: bool = False
+    init_llm_checked: bool = False,
+    reference_audio=None,
 ) -> tuple:
     """Update instruction and UI visibility based on task type."""
     instruction = dit_handler.generate_instruction(
@@ -559,15 +757,22 @@ def update_instruction_ui(
     track_name_visible = task_type_value in ["lego", "extract"]
     # Show complete_track_classes for complete
     complete_visible = task_type_value == "complete"
-    # Show audio_cover_strength for cover OR when LM is initialized
-    audio_cover_strength_visible = (task_type_value == "cover") or init_llm_checked
-    # Determine label and info based on context
-    if init_llm_checked and task_type_value != "cover":
-        audio_cover_strength_label = "LM codes strength"
-        audio_cover_strength_info = "Control how many denoising steps use LM-generated codes"
+    # Show audio_cover_strength for cover, LM initialized, or reference audio present
+    has_reference = _has_reference_audio(reference_audio)
+    audio_cover_strength_visible = (task_type_value == "cover") or init_llm_checked or has_reference
+    # Label priority: cover -> LM codes -> Similarity/Denoise (reference audio)
+    if task_type_value == "cover":
+        audio_cover_strength_label = t("generation.cover_strength_label")
+        audio_cover_strength_info = t("generation.cover_strength_info")
+    elif init_llm_checked:
+        audio_cover_strength_label = t("generation.codes_strength_label")
+        audio_cover_strength_info = t("generation.codes_strength_info")
+    elif has_reference:
+        audio_cover_strength_label = t("generation.similarity_denoise_label")
+        audio_cover_strength_info = t("generation.similarity_denoise_info")
     else:
-        audio_cover_strength_label = "Audio Cover Strength"
-        audio_cover_strength_info = "Control how many denoising steps use cover mode"
+        audio_cover_strength_label = t("generation.cover_strength_label")
+        audio_cover_strength_info = t("generation.cover_strength_info")
     # Show repainting controls for repaint and lego
     repainting_visible = task_type_value in ["repaint", "lego"]
     # Show text2music_audio_codes if task is text2music OR if it has content
@@ -701,7 +906,13 @@ def update_audio_components_visibility(batch_size):
     Row 2: Components 5-8 (batch_size 5-8)
     """
     # Clamp batch size to 1-8 range for UI
-    batch_size = min(max(int(batch_size), 1), 8)
+    if batch_size is None:
+        batch_size = 1
+    else:
+        try:
+            batch_size = min(max(int(batch_size), 1), 8)
+        except (TypeError, ValueError):
+            batch_size = 1
     
     # Row 1 columns (1-4)
     updates_row1 = (
@@ -800,6 +1011,7 @@ def handle_create_sample(
         - audio_duration
         - key_scale
         - vocal_language
+        - simple_vocal_language
         - time_signature
         - instrumental_checkbox
         - caption_accordion (open)
@@ -820,6 +1032,7 @@ def handle_create_sample(
             gr.update(),  # audio_duration - no change
             gr.update(),  # key_scale - no change
             gr.update(),  # vocal_language - no change
+            gr.update(),  # simple vocal_language - no change
             gr.update(),  # time_signature - no change
             gr.update(),  # instrumental_checkbox - no change
             gr.update(),  # caption_accordion - no change
@@ -1023,4 +1236,3 @@ def handle_format_sample(
         True,  # is_format_caption_state - True (LM-formatted)
         result.status_message,  # status_output
     )
-
