@@ -9,6 +9,7 @@ data/
 *.mp3
 *.wav
 .fuse*
+certificate.pem
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
