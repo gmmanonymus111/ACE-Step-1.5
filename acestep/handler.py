@@ -8,54 +8,99 @@ import sys
 # Disable tokenizers parallelism to avoid fork warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import math
-from copy import deepcopy
-import tempfile
-import traceback
-import re
-import random
-import uuid
-import hashlib
-import json
 import threading
-from contextlib import contextmanager
-from typing import Optional, Dict, Any, Tuple, List, Union
+from typing import Optional
 
 import torch
-import torchaudio
-import soundfile as sf
-import time
-from tqdm import tqdm
-from loguru import logger
 import warnings
 
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
-from transformers.generation.streamers import BaseStreamer
-from diffusers.models import AutoencoderOobleck
-from acestep.model_downloader import (
-    ensure_main_model,
-    ensure_dit_model,
-    check_main_model_exists,
-    check_model_exists,
-    get_checkpoints_dir,
+from acestep.core.generation.handler import (
+    AudioCodesMixin,
+    BatchPrepMixin,
+    ConditioningBatchMixin,
+    ConditioningEmbedMixin,
+    ConditioningMaskMixin,
+    ConditioningTargetMixin,
+    ConditioningTextMixin,
+    DiffusionMixin,
+    GenerateMusicDecodeMixin,
+    GenerateMusicExecuteMixin,
+    GenerateMusicMixin,
+    GenerateMusicPayloadMixin,
+    GenerateMusicRequestMixin,
+    InitServiceMixin,
+    IoAudioMixin,
+    LyricScoreMixin,
+    LyricTimestampMixin,
+    LoraManagerMixin,
+    MemoryUtilsMixin,
+    MetadataMixin,
+    MlxDitInitMixin,
+    MlxVaeDecodeNativeMixin,
+    MlxVaeEncodeNativeMixin,
+    MlxVaeInitMixin,
+    PaddingMixin,
+    ProgressMixin,
+    PromptMixin,
+    ServiceGenerateMixin,
+    TrainingPresetMixin,
+    TaskUtilsMixin,
+    VaeDecodeChunksMixin,
+    VaeDecodeMixin,
+    VaeEncodeChunksMixin,
+    VaeEncodeMixin,
+    ServiceGenerateRequestMixin,
+    ServiceGenerateExecuteMixin,
+    ServiceGenerateOutputsMixin,
 )
-from acestep.constants import (
-    TASK_INSTRUCTIONS,
-    SFT_GEN_PROMPT,
-    DEFAULT_DIT_INSTRUCTION,
-)
-from acestep.core.generation.handler import LoraManagerMixin, ProgressMixin
-from acestep.dit_alignment_score import MusicStampsAligner, MusicLyricScorer
-from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_effective_free_vram_gb
 
 
 warnings.filterwarnings("ignore")
 
 
-class AceStepHandler(LoraManagerMixin, ProgressMixin):
+class AceStepHandler(
+    DiffusionMixin,
+    GenerateMusicMixin,
+    GenerateMusicDecodeMixin,
+    GenerateMusicPayloadMixin,
+    GenerateMusicExecuteMixin,
+    GenerateMusicRequestMixin,
+    AudioCodesMixin,
+    BatchPrepMixin,
+    ConditioningBatchMixin,
+    ConditioningEmbedMixin,
+    ConditioningMaskMixin,
+    ConditioningTargetMixin,
+    ConditioningTextMixin,
+    IoAudioMixin,
+    InitServiceMixin,
+    LyricScoreMixin,
+    LyricTimestampMixin,
+    LoraManagerMixin,
+    MemoryUtilsMixin,
+    MetadataMixin,
+    MlxDitInitMixin,
+    MlxVaeDecodeNativeMixin,
+    MlxVaeEncodeNativeMixin,
+    MlxVaeInitMixin,
+    PaddingMixin,
+    ProgressMixin,
+    PromptMixin,
+    ServiceGenerateMixin,
+    TrainingPresetMixin,
+    TaskUtilsMixin,
+    VaeDecodeChunksMixin,
+    VaeDecodeMixin,
+    VaeEncodeChunksMixin,
+    VaeEncodeMixin,
+    ServiceGenerateRequestMixin,
+    ServiceGenerateExecuteMixin,
+    ServiceGenerateOutputsMixin,
+):
     """ACE-Step Business Logic Handler"""
     
     def __init__(self):
+        """Initialize runtime model handles, feature flags, and generation state."""
         self.model = None
         self.config = None
         self.device = "cpu"
@@ -107,14 +152,20 @@ class AceStepHandler(LoraManagerMixin, ProgressMixin):
         # LoRA state
         self.lora_loaded = False
         self.use_lora = False
-        self.lora_scale = 1.0  # LoRA influence scale (0-1)
-        self._base_decoder = None  # Backup of original decoder
+        self.lora_scale = 1.0  # LoRA influence scale (0-1), mirrors active adapter's scale
+        self._base_decoder = None  # Backup of original decoder state_dict (CPU) for memory efficiency
+        self._active_loras = {}  # adapter_name -> scale (per-adapter)
         self._lora_adapter_registry = {}  # adapter_name -> explicit scaling targets
         self._lora_active_adapter = None
 
         # MLX DiT acceleration (macOS Apple Silicon only)
         self.mlx_decoder = None
         self.use_mlx_dit = False
+        self.mlx_dit_compiled = False
+        
+        # MLX VAE acceleration (macOS Apple Silicon only)
+        self.mlx_vae = None
+        self.use_mlx_vae = False
 
     # ------------------------------------------------------------------
     # MLX DiT acceleration helpers
@@ -4291,12 +4342,3 @@ class AceStepHandler(LoraManagerMixin, ProgressMixin):
                 "error": None
             }
 
-        except Exception as e:
-            error_msg = f"Error generating score: {str(e)}"
-            logger.exception("[get_lyric_score] Failed")
-            return {
-                "lm_score": 0.0,
-                "dit_score": 0.0,
-                "success": False,
-                "error": error_msg
-            }
