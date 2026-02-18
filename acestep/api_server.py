@@ -70,6 +70,8 @@ from acestep.gpu_config import (
     get_recommended_lm_model,
     is_lm_model_supported,
     VRAM_AUTO_OFFLOAD_THRESHOLD_GB,
+    get_gpu_count,
+    auto_assign_devices,
 )
 
 
@@ -950,6 +952,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 
+def _resolve_lm_device(lm_device: str, dit_device: str = "auto") -> str:
+    """Resolve LM device string, auto-assigning to second GPU when available."""
+    if lm_device == "auto":
+        if get_gpu_count() >= 2:
+            _, resolved = auto_assign_devices()
+            return resolved
+        return dit_device if dit_device != "auto" else "cuda:0"
+    return lm_device
+
+
 def _get_model_name(config_path: str) -> str:
     """
     Extract model name from config_path.
@@ -1538,7 +1550,10 @@ def create_app() -> FastAPI:
                             except Exception as e:
                                 print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
 
-                        lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
+                        lm_device = _resolve_lm_device(
+                            os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto")),
+                            dit_device=os.getenv("ACESTEP_DEVICE", "auto"),
+                        )
                         lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
 
                         status, ok = llm.initialize(
@@ -2378,7 +2393,10 @@ def create_app() -> FastAPI:
                 lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
                 if lm_backend not in {"vllm", "pt", "mlx"}:
                     lm_backend = "vllm"
-                lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
+                lm_device = _resolve_lm_device(
+                    os.getenv("ACESTEP_LM_DEVICE", "auto"),
+                    dit_device=device,
+                )
 
                 # Auto-determine LM offload based on GPU config
                 lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
@@ -2926,7 +2944,10 @@ def create_app() -> FastAPI:
                     except Exception as e:
                         print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
 
-                lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
+                lm_device = _resolve_lm_device(
+                    os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto")),
+                    dit_device=os.getenv("ACESTEP_DEVICE", "auto"),
+                )
                 lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
                 status, ok = llm.initialize(
                     checkpoint_dir=checkpoint_dir,
